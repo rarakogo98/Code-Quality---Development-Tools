@@ -5,9 +5,14 @@
 (define-constant ERR-RULE-NOT-FOUND (err u103))
 (define-constant ERR-INVALID-SCORE (err u104))
 (define-constant ERR-SCAN-NOT-FOUND (err u105))
+(define-constant ERR-FRAMEWORK-NOT-FOUND (err u106))
+(define-constant ERR-INVALID-FRAMEWORK (err u107))
+(define-constant ERR-REPORT-NOT-FOUND (err u108))
 
 (define-data-var next-rule-id uint u1)
 (define-data-var next-scan-id uint u1)
+(define-data-var next-framework-id uint u1)
+(define-data-var next-report-id uint u1)
 
 (define-map linting-rules
     uint
@@ -56,6 +61,35 @@
     }
 )
 
+(define-map compliance-frameworks
+    uint
+    {
+        name: (string-ascii 50),
+        description: (string-ascii 200),
+        version: (string-ascii 10),
+        categories: (list 10 (string-ascii 20)),
+        min-score-threshold: uint,
+        created-by: principal,
+        active: bool
+    }
+)
+
+(define-map compliance-reports
+    uint
+    {
+        framework-id: uint,
+        scan-id: uint,
+        contract-address: principal,
+        compliance-score: uint,
+        passed-checks: uint,
+        failed-checks: uint,
+        total-checks: uint,
+        certification-level: (string-ascii 20),
+        report-timestamp: uint,
+        generated-by: principal
+    }
+)
+
 (define-read-only (get-rule (rule-id uint))
     (map-get? linting-rules rule-id)
 )
@@ -78,6 +112,22 @@
 
 (define-read-only (get-next-scan-id)
     (var-get next-scan-id)
+)
+
+(define-read-only (get-compliance-framework (framework-id uint))
+    (map-get? compliance-frameworks framework-id)
+)
+
+(define-read-only (get-compliance-report (report-id uint))
+    (map-get? compliance-reports report-id)
+)
+
+(define-read-only (get-next-framework-id)
+    (var-get next-framework-id)
+)
+
+(define-read-only (get-next-report-id)
+    (var-get next-report-id)
 )
 
 (define-public (create-linting-rule 
@@ -294,4 +344,140 @@
 
 (define-private (get-rule-with-id (rule-id uint))
     (some {rule-id: rule-id, data: (map-get? linting-rules rule-id)})
+)
+
+(define-public (create-compliance-framework
+    (name (string-ascii 50))
+    (description (string-ascii 200))
+    (version (string-ascii 10))
+    (categories (list 10 (string-ascii 20)))
+    (min-score-threshold uint))
+    (let ((framework-id (var-get next-framework-id)))
+        (asserts! (> (len name) u0) ERR-INVALID-FRAMEWORK)
+        (asserts! (> (len description) u0) ERR-INVALID-FRAMEWORK)
+        (asserts! (> (len version) u0) ERR-INVALID-FRAMEWORK)
+        (asserts! (<= min-score-threshold u100) ERR-INVALID-FRAMEWORK)
+        
+        (map-set compliance-frameworks framework-id {
+            name: name,
+            description: description,
+            version: version,
+            categories: categories,
+            min-score-threshold: min-score-threshold,
+            created-by: tx-sender,
+            active: true
+        })
+        
+        (var-set next-framework-id (+ framework-id u1))
+        (ok framework-id)
+    )
+)
+
+(define-public (generate-compliance-report
+    (framework-id uint)
+    (scan-id uint)
+    (passed-checks uint)
+    (failed-checks uint))
+    (let ((report-id (var-get next-report-id))
+          (total-checks (+ passed-checks failed-checks))
+          (compliance-score (calculate-compliance-score passed-checks total-checks)))
+        
+        (asserts! (is-some (map-get? compliance-frameworks framework-id)) ERR-FRAMEWORK-NOT-FOUND)
+        (asserts! (is-some (map-get? scan-results scan-id)) ERR-SCAN-NOT-FOUND)
+        (asserts! (> total-checks u0) ERR-INVALID-SCORE)
+        
+        (let ((framework-data (unwrap! (map-get? compliance-frameworks framework-id) ERR-FRAMEWORK-NOT-FOUND))
+              (scan-data (unwrap! (map-get? scan-results scan-id) ERR-SCAN-NOT-FOUND))
+              (certification-level (get-certification-level compliance-score (get min-score-threshold framework-data))))
+            
+            (map-set compliance-reports report-id {
+                framework-id: framework-id,
+                scan-id: scan-id,
+                contract-address: (get contract-address scan-data),
+                compliance-score: compliance-score,
+                passed-checks: passed-checks,
+                failed-checks: failed-checks,
+                total-checks: total-checks,
+                certification-level: certification-level,
+                report-timestamp: stacks-block-height,
+                generated-by: tx-sender
+            })
+            
+            (var-set next-report-id (+ report-id u1))
+            (ok report-id)
+        )
+    )
+)
+
+(define-public (toggle-framework (framework-id uint))
+    (match (map-get? compliance-frameworks framework-id)
+        framework-data
+        (begin
+            (asserts! (or (is-eq tx-sender CONTRACT-OWNER) 
+                         (is-eq tx-sender (get created-by framework-data))) ERR-NOT-AUTHORIZED)
+            (map-set compliance-frameworks framework-id 
+                (merge framework-data {active: (not (get active framework-data))}))
+            (ok true)
+        )
+        ERR-FRAMEWORK-NOT-FOUND
+    )
+)
+
+(define-read-only (get-compliance-status (report-id uint))
+    (match (map-get? compliance-reports report-id)
+        report-data
+        (let ((compliance-score (get compliance-score report-data))
+              (certification-level (get certification-level report-data)))
+            (ok {
+                score: compliance-score,
+                level: certification-level,
+                passed: (> compliance-score u0),
+                excellence: (>= compliance-score u95)
+            })
+        )
+        ERR-REPORT-NOT-FOUND
+    )
+)
+
+(define-read-only (get-framework-compliance-history (framework-id uint) (contract-address principal))
+    (let ((report-ids (list u1 u2 u3 u4 u5)))
+        (filter is-framework-contract-match
+            (map get-report-with-id report-ids)
+        )
+    )
+)
+
+(define-private (calculate-compliance-score (passed-checks uint) (total-checks uint))
+    (if (is-eq total-checks u0)
+        u0
+        (/ (* passed-checks u100) total-checks)
+    )
+)
+
+(define-private (get-certification-level (score uint) (threshold uint))
+    (if (>= score u95) "platinum"
+        (if (>= score u85) "gold"
+            (if (>= score u75) "silver"
+                (if (>= score threshold) "bronze"
+                    "uncertified"
+                )
+            )
+        )
+    )
+)
+
+(define-private (is-framework-contract-match (report-option (optional {report-id: uint, data: (optional {framework-id: uint, scan-id: uint, contract-address: principal, compliance-score: uint, passed-checks: uint, failed-checks: uint, total-checks: uint, certification-level: (string-ascii 20), report-timestamp: uint, generated-by: principal})})))
+    (match report-option
+        report-info
+        (match (get data report-info)
+            report-data
+            true
+            false
+        )
+        false
+    )
+)
+
+(define-private (get-report-with-id (report-id uint))
+    (some {report-id: report-id, data: (map-get? compliance-reports report-id)})
 )
