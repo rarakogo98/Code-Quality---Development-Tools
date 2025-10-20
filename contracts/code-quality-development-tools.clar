@@ -8,11 +8,14 @@
 (define-constant ERR-FRAMEWORK-NOT-FOUND (err u106))
 (define-constant ERR-INVALID-FRAMEWORK (err u107))
 (define-constant ERR-REPORT-NOT-FOUND (err u108))
+(define-constant ERR-AUDIT-NOT-FOUND (err u109))
+(define-constant ERR-INVALID-AUDIT-QUERY (err u110))
 
 (define-data-var next-rule-id uint u1)
 (define-data-var next-scan-id uint u1)
 (define-data-var next-framework-id uint u1)
 (define-data-var next-report-id uint u1)
+(define-data-var next-audit-id uint u1)
 
 (define-map linting-rules
     uint
@@ -90,6 +93,21 @@
     }
 )
 
+(define-map rule-audit-trail
+    uint
+    {
+        rule-id: uint,
+        action: (string-ascii 20),
+        previous-severity: (string-ascii 10),
+        new-severity: (string-ascii 10),
+        previous-enabled: bool,
+        new-enabled: bool,
+        changed-by: principal,
+        change-timestamp: uint,
+        change-reason: (string-ascii 100)
+    }
+)
+
 (define-read-only (get-rule (rule-id uint))
     (map-get? linting-rules rule-id)
 )
@@ -128,6 +146,14 @@
 
 (define-read-only (get-next-report-id)
     (var-get next-report-id)
+)
+
+(define-read-only (get-audit-entry (audit-id uint))
+    (map-get? rule-audit-trail audit-id)
+)
+
+(define-read-only (get-next-audit-id)
+    (var-get next-audit-id)
 )
 
 (define-public (create-linting-rule 
@@ -174,17 +200,71 @@
     (match (map-get? linting-rules rule-id)
         rule-data
         (begin
-            (asserts! (or (is-eq tx-sender CONTRACT-OWNER) 
+            (asserts! (or (is-eq tx-sender CONTRACT-OWNER)
                          (is-eq tx-sender (get created-by rule-data))) ERR-NOT-AUTHORIZED)
-            (map-set linting-rules rule-id 
-                (merge rule-data {enabled: (not (get enabled rule-data))}))
-            (ok true)
+            (let ((audit-id (var-get next-audit-id))
+                  (old-enabled (get enabled rule-data))
+                  (new-enabled (not old-enabled)))
+                (map-set linting-rules rule-id
+                    (merge rule-data {enabled: new-enabled}))
+
+                (map-set rule-audit-trail audit-id {
+                    rule-id: rule-id,
+                    action: "toggle",
+                    previous-severity: (get severity rule-data),
+                    new-severity: (get severity rule-data),
+                    previous-enabled: old-enabled,
+                    new-enabled: new-enabled,
+                    changed-by: tx-sender,
+                    change-timestamp: stacks-block-height,
+                    change-reason: "rule-toggled"
+                })
+
+                (var-set next-audit-id (+ audit-id u1))
+                (ok true)
+            )
         )
         ERR-RULE-NOT-FOUND
     )
 )
 
-(define-public (perform-security-scan 
+(define-public (record-rule-severity-change
+    (rule-id uint)
+    (previous-severity (string-ascii 10))
+    (new-severity (string-ascii 10))
+    (change-reason (string-ascii 100)))
+    (match (map-get? linting-rules rule-id)
+        rule-data
+        (begin
+            (asserts! (or (is-eq tx-sender CONTRACT-OWNER)
+                         (is-eq tx-sender (get created-by rule-data))) ERR-NOT-AUTHORIZED)
+            (asserts! (or (is-eq new-severity "critical")
+                          (is-eq new-severity "high")
+                          (is-eq new-severity "medium")
+                          (is-eq new-severity "low")) ERR-INVALID-RULE)
+
+            (let ((audit-id (var-get next-audit-id)))
+                (map-set rule-audit-trail audit-id {
+                    rule-id: rule-id,
+                    action: "severity-change",
+                    previous-severity: previous-severity,
+                    new-severity: new-severity,
+                    previous-enabled: (get enabled rule-data),
+                    new-enabled: (get enabled rule-data),
+                    changed-by: tx-sender,
+                    change-timestamp: stacks-block-height,
+                    change-reason: change-reason
+                })
+
+                (var-set next-audit-id (+ audit-id u1))
+                (ok audit-id)
+            )
+        )
+        ERR-RULE-NOT-FOUND
+    )
+)
+
+(define-public (perform-security-scan
     (contract-address principal)
     (total-issues uint)
     (critical-issues uint)
@@ -244,7 +324,7 @@
     )
 )
 
-(define-public (update-rule 
+(define-public (update-rule
     (rule-id uint)
     (name (string-ascii 50))
     (description (string-ascii 200))
@@ -253,24 +333,41 @@
     (match (map-get? linting-rules rule-id)
         rule-data
         (begin
-            (asserts! (or (is-eq tx-sender CONTRACT-OWNER) 
+            (asserts! (or (is-eq tx-sender CONTRACT-OWNER)
                          (is-eq tx-sender (get created-by rule-data))) ERR-NOT-AUTHORIZED)
             (asserts! (> (len name) u0) ERR-INVALID-RULE)
             (asserts! (> (len description) u0) ERR-INVALID-RULE)
-            (asserts! (or (is-eq severity "critical") 
-                          (is-eq severity "high") 
-                          (is-eq severity "medium") 
+            (asserts! (or (is-eq severity "critical")
+                          (is-eq severity "high")
+                          (is-eq severity "medium")
                           (is-eq severity "low")) ERR-INVALID-RULE)
-            
-            (map-set linting-rules rule-id {
-                name: name,
-                description: description,
-                severity: severity,
-                category: category,
-                enabled: (get enabled rule-data),
-                created-by: (get created-by rule-data)
-            })
-            (ok true)
+
+            (let ((audit-id (var-get next-audit-id))
+                  (old-severity (get severity rule-data)))
+                (map-set linting-rules rule-id {
+                    name: name,
+                    description: description,
+                    severity: severity,
+                    category: category,
+                    enabled: (get enabled rule-data),
+                    created-by: (get created-by rule-data)
+                })
+
+                (map-set rule-audit-trail audit-id {
+                    rule-id: rule-id,
+                    action: "update",
+                    previous-severity: old-severity,
+                    new-severity: severity,
+                    previous-enabled: (get enabled rule-data),
+                    new-enabled: (get enabled rule-data),
+                    changed-by: tx-sender,
+                    change-timestamp: stacks-block-height,
+                    change-reason: "rule-updated"
+                })
+
+                (var-set next-audit-id (+ audit-id u1))
+                (ok true)
+            )
         )
         ERR-RULE-NOT-FOUND
     )
