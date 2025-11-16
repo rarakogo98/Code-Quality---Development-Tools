@@ -578,3 +578,44 @@
 (define-private (get-report-with-id (report-id uint))
     (some {report-id: report-id, data: (map-get? compliance-reports report-id)})
 )
+
+(define-private (process-violation-entry (entry {scan-id: uint, rule-id: uint, line-number: uint, column-number: uint, message: (string-ascii 200), suggestion: (string-ascii 200)}))
+    (let ((scan-id (get scan-id entry))
+          (rule-id (get rule-id entry))
+          (line-number (get line-number entry))
+          (column-number (get column-number entry))
+          (message (get message entry))
+          (suggestion (get suggestion entry)))
+        (match (map-get? scan-results scan-id)
+            scan-data
+            (match (map-get? linting-rules rule-id)
+                rule-data
+                (if (and (> (len message) u0) (is-eq tx-sender (get scanned-by scan-data)))
+                    (begin
+                        (map-set rule-violations {scan-id: scan-id, rule-id: rule-id} {
+                            line-number: line-number,
+                            column-number: column-number,
+                            message: message,
+                            suggestion: suggestion
+                        })
+                        true
+                    )
+                    false
+                )
+                false
+            )
+            false
+        )
+    )
+)
+
+(define-private (is-true (b bool))
+    b
+)
+
+(define-public (add-rule-violations-batch (entries (list 100 {scan-id: uint, rule-id: uint, line-number: uint, column-number: uint, message: (string-ascii 200), suggestion: (string-ascii 200)})))
+    (let ((results (map process-violation-entry entries))
+          (successes (filter is-true results)))
+        (ok (len successes))
+    )
+)
