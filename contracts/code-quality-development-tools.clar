@@ -10,6 +10,9 @@
 (define-constant ERR-REPORT-NOT-FOUND (err u108))
 (define-constant ERR-AUDIT-NOT-FOUND (err u109))
 (define-constant ERR-INVALID-AUDIT-QUERY (err u110))
+(define-constant ERR-SCANNER-NOT-FOUND (err u111))
+(define-constant ERR-SCANNER-INACTIVE (err u112))
+(define-constant ERR-INVALID-SCANNER (err u113))
 
 (define-data-var next-rule-id uint u1)
 (define-data-var next-scan-id uint u1)
@@ -41,6 +44,27 @@
         quality-score: uint,
         scan-timestamp: uint,
         scanned-by: principal
+    }
+)
+
+(define-map scanners
+    principal
+    {
+        name: (string-ascii 50),
+        endpoint: (string-ascii 120),
+        active: bool,
+        registered-by: principal,
+        registered-at: uint
+    }
+)
+
+(define-map scan-attestations
+    uint
+    {
+        report-hash: (buff 32),
+        report-uri: (string-ascii 120),
+        attested-by: principal,
+        attested-at: uint
     }
 )
 
@@ -114,6 +138,14 @@
 
 (define-read-only (get-scan-result (scan-id uint))
     (map-get? scan-results scan-id)
+)
+
+(define-read-only (get-scanner (scanner principal))
+    (map-get? scanners scanner)
+)
+
+(define-read-only (get-scan-attestation (scan-id uint))
+    (map-get? scan-attestations scan-id)
 )
 
 (define-read-only (get-rule-violation (scan-id uint) (rule-id uint))
@@ -294,6 +326,91 @@
         (update-user-stats tx-sender quality-score)
         
         (ok scan-id)
+    )
+)
+
+(define-private (require-active-scanner (scanner principal))
+    (match (map-get? scanners scanner)
+        scanner-data
+        (if (get active scanner-data)
+            (ok true)
+            ERR-SCANNER-INACTIVE
+        )
+        ERR-SCANNER-NOT-FOUND
+    )
+)
+
+(define-public (register-scanner
+    (scanner principal)
+    (name (string-ascii 50))
+    (endpoint (string-ascii 120)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> (len name) u0) ERR-INVALID-SCANNER)
+        (asserts! (> (len endpoint) u0) ERR-INVALID-SCANNER)
+        (map-set scanners scanner {
+            name: name,
+            endpoint: endpoint,
+            active: true,
+            registered-by: tx-sender,
+            registered-at: stacks-block-height
+        })
+        (ok true)
+    )
+)
+
+(define-public (set-scanner-active (scanner principal) (active bool))
+    (match (map-get? scanners scanner)
+        scanner-data
+        (begin
+            (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+            (map-set scanners scanner (merge scanner-data {active: active}))
+            (ok true)
+        )
+        ERR-SCANNER-NOT-FOUND
+    )
+)
+
+(define-public (perform-security-scan-attested
+    (contract-address principal)
+    (total-issues uint)
+    (critical-issues uint)
+    (high-issues uint)
+    (medium-issues uint)
+    (low-issues uint)
+    (report-hash (buff 32))
+    (report-uri (string-ascii 120)))
+    (begin
+        (try! (require-active-scanner tx-sender))
+        (let ((scan-id (var-get next-scan-id))
+              (quality-score (calculate-quality-score total-issues critical-issues high-issues)))
+            (asserts! (<= (+ critical-issues high-issues medium-issues low-issues) total-issues) ERR-INVALID-SCORE)
+            (asserts! (<= quality-score u100) ERR-INVALID-SCORE)
+            (asserts! (> (len report-uri) u0) ERR-INVALID-SCANNER)
+
+            (map-set scan-results scan-id {
+                contract-address: contract-address,
+                total-issues: total-issues,
+                critical-issues: critical-issues,
+                high-issues: high-issues,
+                medium-issues: medium-issues,
+                low-issues: low-issues,
+                quality-score: quality-score,
+                scan-timestamp: stacks-block-height,
+                scanned-by: tx-sender
+            })
+
+            (map-set scan-attestations scan-id {
+                report-hash: report-hash,
+                report-uri: report-uri,
+                attested-by: tx-sender,
+                attested-at: stacks-block-height
+            })
+
+            (var-set next-scan-id (+ scan-id u1))
+            (update-user-stats tx-sender quality-score)
+            (ok scan-id)
+        )
     )
 )
 
