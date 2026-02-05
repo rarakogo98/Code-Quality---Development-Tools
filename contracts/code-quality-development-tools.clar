@@ -13,6 +13,8 @@
 (define-constant ERR-SCANNER-NOT-FOUND (err u111))
 (define-constant ERR-SCANNER-INACTIVE (err u112))
 (define-constant ERR-INVALID-SCANNER (err u113))
+(define-constant ERR-INVALID-AMOUNT (err u114))
+(define-constant ERR-CANNOT-TIP-SELF (err u115))
 
 (define-data-var next-rule-id uint u1)
 (define-data-var next-scan-id uint u1)
@@ -130,6 +132,11 @@
         change-timestamp: uint,
         change-reason: (string-ascii 100)
     }
+)
+
+(define-map rule-earnings
+    uint
+    uint
 )
 
 (define-read-only (get-rule (rule-id uint))
@@ -734,5 +741,24 @@
     (let ((results (map process-violation-entry entries))
           (successes (filter is-true results)))
         (ok (len successes))
+    )
+)
+
+(define-read-only (get-rule-earnings (rule-id uint))
+    (default-to u0 (map-get? rule-earnings rule-id))
+)
+
+(define-public (tip-rule-creator (rule-id uint) (amount uint))
+    (let ((rule (unwrap! (map-get? linting-rules rule-id) ERR-RULE-NOT-FOUND))
+          (creator (get created-by rule)))
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (not (is-eq tx-sender creator)) ERR-CANNOT-TIP-SELF)
+        
+        (try! (stx-transfer? amount tx-sender creator))
+        
+        (map-set rule-earnings rule-id 
+            (+ (get-rule-earnings rule-id) amount))
+            
+        (ok true)
     )
 )
